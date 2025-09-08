@@ -1,279 +1,566 @@
-﻿using System.Runtime.InteropServices;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
 
-public static partial class WindowsCredentialManager
+namespace WindowsCredentialManagerAPI
 {
-    // --- P/Invoke Deklarationen für Credential Manager API ---
-
-    private const string CredmgrDll = "advapi32.dll";
-
-    // Gemacht internal, da nur intern von dieser Klasse oder anderen in derselben Assembly benötigt
-    internal enum CREDENTIAL_TYPE : uint
+    /// <summary>
+    /// Provides access to the Windows Credential Manager for storing and retrieving credentials securely
+    /// </summary>
+    public static class WindowsCredentialManager
     {
-        GENERIC = 1,
-    }
+        #region Win32 API Declarations
 
-    // Fix for CS0051: Make the CRED_PERSIST enum public to match the accessibility of the SavePassword method.
-    public enum CRED_PERSIST : uint
-    {
-        SESSION = 1,
-        LOCAL_MACHINE = 2,
-        ENTERPRISE = 3,
-    }
-
-    // Gemacht internal
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct FILETIME
-    {
-        public uint dwLowDateTime;
-        public uint dwHighDateTime;
-    }
-
-    // Gemacht internal
-    [StructLayout(LayoutKind.Sequential)]
-    internal struct CREDENTIAL
-    {
-        public uint Flags;
-        public uint Type;
-        public IntPtr TargetName; // LPWSTR
-        public IntPtr Comment; // LPWSTR
-        public FILETIME LastWritten;
-        public uint CredentialBlobSize;
-        public IntPtr CredentialBlob; // BYTE *
-        public uint Persist; // CRED_PERSIST
-        public uint AttributeCount;
-        public IntPtr Attributes; // PCREDENTIAL_ATTRIBUTE
-        public IntPtr AcquireCredentialsHandle;
-        public IntPtr AcquireCredentialsHandleArgs;
-    }
-
-    [LibraryImport(CredmgrDll, EntryPoint = "CredReadW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
-    [return: MarshalAs(UnmanagedType.Bool)] // Gibt Bool zurück
-    internal static partial bool CredRead(
-        string TargetName,
-        CREDENTIAL_TYPE Type,
-        int Flags,
-        out IntPtr Credential // Wird von API zugewiesen
-    );
-
-    [DllImport(CredmgrDll, EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static extern bool CredWrite(
-        ref CREDENTIAL Credential,
-        int Flags
-    );
-
-    [DllImport(CredmgrDll, EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    internal static extern bool CredDelete(
-        string TargetName,
-        CREDENTIAL_TYPE Type,
-        int Flags
-    );
-
-    [DllImport(CredmgrDll, EntryPoint = "CredFree", SetLastError = true)]
-    internal static extern void CredFree(IntPtr Credential);
-
-    // --- Hilfsfunktion zum Konvertieren und Löschen von SecureString ---
-    // Nutzt die ClearBytes Methode aus HighlySecureAuthenticatedVersionedCipher
-    private static byte[]? SecureStringToBytes(SecureString secureString)
-    {
-        if (secureString == null) return null;
-
-        IntPtr unmanagedBytes = IntPtr.Zero;
-        IntPtr managedBytesPtr = IntPtr.Zero; // Für das Byte-Array, das wir manuell erstellen
-
-        try
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct CREDENTIAL
         {
-            // Marshal.SecureStringToGlobalAllocUnicode kopiert SecureString sicher
-            // in unmanaged Speicher und gibt einen Pointer zurück.
-            unmanagedBytes = Marshal.SecureStringToGlobalAllocUnicode(secureString);
-
-            // Die Länge ist die Anzahl der Zeichen * 2 (für UTF16/Unicode).
-            int byteLength = secureString.Length * 2;
-
-            // Erstelle ein managed Byte-Array und kopiere die Daten hinein.
-            byte[] bytes = new byte[byteLength];
-            Marshal.Copy(unmanagedBytes, bytes, 0, byteLength);
-
-            // Gib das managed Byte-Array zurück. Der AUFRUFER muss es löschen!
-            return bytes;
+            public int Flags;
+            public int Type;
+            public IntPtr TargetName;
+            public IntPtr Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public int CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public int Persist;
+            public int AttributeCount;
+            public IntPtr Attributes;
+            public IntPtr TargetAlias;
+            public IntPtr UserName;
         }
-        finally
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredWrite([In] ref CREDENTIAL userCredential, [In] uint flags);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredDelete(string target, int type, int reservedFlag);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CredEnumerate(string? filter, int flag, out int count, out IntPtr pCredentials);
+
+        [DllImport("advapi32.dll")]
+        private static extern void CredFree([In] IntPtr buffer);
+
+        #endregion
+
+        #region Private Helper Methods
+
+        /// <summary>
+        /// Securely clears a byte array by overwriting with zeros
+        /// </summary>
+        /// <param name="data">The byte array to clear</param>
+        private static void SecureClearBytes(byte[]? data)
         {
-            // Lösche den unmanaged Speicher sicher
-            if (unmanagedBytes != IntPtr.Zero)
+            if (data != null)
             {
-                Marshal.ZeroFreeGlobalAllocAnsi(unmanagedBytes);
+                Array.Clear(data, 0, data.Length);
             }
         }
-    }
 
-    public static bool SavePassword(string targetName, SecureString password, CRED_PERSIST persistType = CRED_PERSIST.LOCAL_MACHINE, string? comment = null)
-    {
-        if (string.IsNullOrEmpty(targetName)) throw new ArgumentNullException(nameof(targetName));
-        if (password == null) throw new ArgumentNullException(nameof(password));
-
-        byte[]? passwordBytes = null; // Managed copy
-        IntPtr targetNamePtr = IntPtr.Zero;
-        IntPtr commentPtr = IntPtr.Zero;
-        GCHandle passwordBytesHandle = default;
-
-        try
+        /// <summary>
+        /// Converts a SecureString to a byte array
+        /// </summary>
+        /// <param name="secureString">The SecureString to convert</param>
+        /// <returns>A byte array containing the SecureString data</returns>
+        private static byte[] SecureStringToBytes(SecureString secureString)
         {
-            passwordBytes = SecureStringToBytes(password) ?? [];
-            if (passwordBytes == null) return false;
-
-            passwordBytesHandle = GCHandle.Alloc(passwordBytes, GCHandleType.Pinned);
-            IntPtr credentialBlobPtr = passwordBytesHandle.AddrOfPinnedObject();
-
-            targetNamePtr = Marshal.StringToHGlobalUni(targetName);
-            if (comment != null)
+            IntPtr unmanagedString = IntPtr.Zero;
+            try
             {
-                commentPtr = Marshal.StringToHGlobalUni(comment);
+                unmanagedString = Marshal.SecureStringToGlobalAllocUnicode(secureString);
+                int length = secureString.Length * 2; // Unicode is 2 bytes per character
+                byte[] bytes = new byte[length];
+                Marshal.Copy(unmanagedString, bytes, 0, length);
+                return bytes;
             }
-
-            CREDENTIAL cred = new()
+            finally
             {
-                Flags = 0,
-                Type = (uint)CREDENTIAL_TYPE.GENERIC,
-                TargetName = targetNamePtr,
-                Comment = commentPtr,
-                CredentialBlobSize = (uint)passwordBytes.Length,
-                CredentialBlob = credentialBlobPtr,
-                Persist = (uint)persistType,
+                if (unmanagedString != IntPtr.Zero)
+                {
+                    Marshal.ZeroFreeGlobalAllocUnicode(unmanagedString);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Converts a byte array to a SecureString
+        /// </summary>
+        /// <param name="bytes">The byte array to convert</param>
+        /// <returns>A SecureString containing the data</returns>
+        private static SecureString BytesToSecureString(byte[] bytes)
+        {
+            if (bytes.Length % 2 != 0)
+                throw new ArgumentException("Byte array length must be even for Unicode conversion");
+
+            char[] chars = new char[bytes.Length / 2];
+            Buffer.BlockCopy(bytes, 0, chars, 0, bytes.Length);
+
+            SecureString secureString = new SecureString();
+            try
+            {
+                foreach (char c in chars)
+                {
+                    secureString.AppendChar(c);
+                }
+                secureString.MakeReadOnly();
+                return secureString;
+            }
+            finally
+            {
+                Array.Clear(chars, 0, chars.Length);
+            }
+        }
+
+        #endregion
+
+        #region Public Methods
+
+        /// <summary>
+        /// Saves a credential to the Windows Credential Manager
+        /// </summary>
+        /// <param name="target">The target name for the credential</param>
+        /// <param name="username">The username</param>
+        /// <param name="password">The password</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <param name="persistence">The persistence level (default: LocalMachine)</param>
+        /// <returns>True if successful, false otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target or username is null or empty</exception>
+        /// <exception cref="ArgumentNullException">Thrown when password is null</exception>
+        public static bool SaveCredential(string target, string username, string password, 
+            CredentialType type = CredentialType.Generic, 
+            CredentialPersistence persistence = CredentialPersistence.LocalMachine)
+        {
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+            if (string.IsNullOrEmpty(username))
+                throw new ArgumentException("Username cannot be null or empty", nameof(username));
+            if (password == null)
+                throw new ArgumentNullException(nameof(password));
+
+            byte[] passwordBytes = Encoding.Unicode.GetBytes(password);
+
+            CREDENTIAL credential = new CREDENTIAL
+            {
                 AttributeCount = 0,
                 Attributes = IntPtr.Zero,
-                AcquireCredentialsHandle = IntPtr.Zero,
-                AcquireCredentialsHandleArgs = IntPtr.Zero
+                Comment = IntPtr.Zero,
+                TargetAlias = IntPtr.Zero,
+                Type = (int)type,
+                Persist = (int)persistence,
+                CredentialBlobSize = passwordBytes.Length,
+                TargetName = Marshal.StringToCoTaskMemUni(target),
+                CredentialBlob = Marshal.AllocCoTaskMem(passwordBytes.Length),
+                UserName = Marshal.StringToCoTaskMemUni(username)
             };
 
-            bool success = CredWrite(ref cred, 0);
-
-            if (!success)
+            try
             {
-                int error = Marshal.GetLastWin32Error();
-                Console.WriteLine($"Error writing credential: {error} (Win32 Error)");
+                Marshal.Copy(passwordBytes, 0, credential.CredentialBlob, passwordBytes.Length);
+                return CredWrite(ref credential, 0);
+            }
+            finally
+            {
+                SecureClearBytes(passwordBytes);
+                Marshal.FreeCoTaskMem(credential.TargetName);
+                Marshal.FreeCoTaskMem(credential.CredentialBlob);
+                Marshal.FreeCoTaskMem(credential.UserName);
+            }
+        }
+
+        /// <summary>
+        /// Saves a credential to the Windows Credential Manager using SecureString
+        /// </summary>
+        /// <param name="target">The target name for the credential</param>
+        /// <param name="username">The username</param>
+        /// <param name="securePassword">The password as SecureString</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <param name="persistence">The persistence level (default: LocalMachine)</param>
+        /// <returns>True if successful, false otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target or username is null or empty</exception>
+        /// <exception cref="ArgumentNullException">Thrown when securePassword is null</exception>
+        public static bool SaveCredential(string target, string username, SecureString securePassword,
+            CredentialType type = CredentialType.Generic,
+            CredentialPersistence persistence = CredentialPersistence.LocalMachine)
+        {
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+            if (string.IsNullOrEmpty(username))
+                throw new ArgumentException("Username cannot be null or empty", nameof(username));
+            if (securePassword == null)
+                throw new ArgumentNullException(nameof(securePassword));
+
+            byte[] passwordBytes = SecureStringToBytes(securePassword);
+
+            CREDENTIAL credential = new CREDENTIAL
+            {
+                AttributeCount = 0,
+                Attributes = IntPtr.Zero,
+                Comment = IntPtr.Zero,
+                TargetAlias = IntPtr.Zero,
+                Type = (int)type,
+                Persist = (int)persistence,
+                CredentialBlobSize = passwordBytes.Length,
+                TargetName = Marshal.StringToCoTaskMemUni(target),
+                CredentialBlob = Marshal.AllocCoTaskMem(passwordBytes.Length),
+                UserName = Marshal.StringToCoTaskMemUni(username)
+            };
+
+            try
+            {
+                Marshal.Copy(passwordBytes, 0, credential.CredentialBlob, passwordBytes.Length);
+                return CredWrite(ref credential, 0);
+            }
+            finally
+            {
+                SecureClearBytes(passwordBytes);
+                Marshal.FreeCoTaskMem(credential.TargetName);
+                Marshal.FreeCoTaskMem(credential.CredentialBlob);
+                Marshal.FreeCoTaskMem(credential.UserName);
+            }
+        }
+
+        /// <summary>
+        /// Retrieves a credential from the Windows Credential Manager
+        /// </summary>
+        /// <param name="target">The target name of the credential</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <returns>A NetworkCredential object if found, null otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target is null or empty</exception>
+        public static NetworkCredential? GetCredential(string target, CredentialType type = CredentialType.Generic)
+        {
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+
+            IntPtr credPtr;
+            if (!CredRead(target, (int)type, 0, out credPtr))
+            {
+                return null;
             }
 
-            return success;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Exception saving credential: {ex.Message}");
-            return false;
-        }
-        finally
-        {
-            HighlySecureAuthenticatedVersionedCipher.ClearBytes(passwordBytes);
-            if (passwordBytesHandle.IsAllocated) passwordBytesHandle.Free();
-
-            if (targetNamePtr != IntPtr.Zero) Marshal.FreeHGlobal(targetNamePtr);
-            if (commentPtr != IntPtr.Zero) Marshal.FreeHGlobal(commentPtr);
-        }
-    }
-
-    /// <summary>
-    /// Lädt ein Passwort aus dem Windows Credential Manager.
-    /// </summary>
-    /// <param name="targetName">Der eindeutige Name des Credentials.</param>
-    /// <returns>Das geladene Passwort als SecureString, oder null, wenn nicht gefunden oder Fehler.</returns>
-    public static SecureString? LoadPassword(string targetName)
-    {
-        if (string.IsNullOrEmpty(targetName)) throw new ArgumentNullException(nameof(targetName));
-
-        IntPtr credPtr = IntPtr.Zero; // Pointer, auf den API die Struktur schreibt
-        SecureString? password = null;
-
-        try
-        {
-            // 1. Credential lesen
-            bool success = CredRead(targetName, CREDENTIAL_TYPE.GENERIC, 0, out credPtr);
-
-            if (!success)
+            try
             {
-                return null; // Credential nicht gefunden oder anderer Fehler
-            }
+                CREDENTIAL cred = Marshal.PtrToStructure<CREDENTIAL>(credPtr);
+                string username = Marshal.PtrToStringUni(cred.UserName) ?? string.Empty;
+                string password = string.Empty;
 
-            // 2. Passwortbytes aus der zurückgegebenen Struktur extrahieren
-            // credPtr zeigt auf die CREDENTIAL Struktur, die von CredRead zugewiesen wurde
-            CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
-
-            if (cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0)
-            {
-                // Kopiere die Bytes aus dem unmanaged Speicher, den die API zurückgegeben hat
-                byte[] passwordBytes = new byte[cred.CredentialBlobSize];
-                Marshal.Copy(cred.CredentialBlob, passwordBytes, 0, (int)cred.CredentialBlobSize);
-
-                // 3. Erstelle SecureString aus den Bytes (UTF16 erwartet)
-                // Wir erwarten, dass die Bytes UTF16 sind, da wir UTF16 bei CredWriteW geschrieben haben
-                // Konvertiere Bytes (UTF16) zurück zu char[] und dann zu SecureString
-                // Stelle sicher, dass die Bytezahl gerade ist, sonst ist es kein gültiges UTF16
-                if (passwordBytes.Length % 2 != 0)
+                if (cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0)
                 {
-                    Console.WriteLine("Warning: Credential Blob size is not a multiple of 2, cannot convert to UTF16 characters.");
-                    HighlySecureAuthenticatedVersionedCipher.ClearBytes(passwordBytes); // Lösche die Bytes trotzdem
-                    return null; // Fehler: Ungültiges Format
+                    byte[] passwordBytes = new byte[cred.CredentialBlobSize];
+                    Marshal.Copy(cred.CredentialBlob, passwordBytes, 0, cred.CredentialBlobSize);
+                    password = Encoding.Unicode.GetString(passwordBytes);
+                    SecureClearBytes(passwordBytes);
                 }
-                char[] passwordChars = new char[passwordBytes.Length / 2];
-                Buffer.BlockCopy(passwordBytes, 0, passwordChars, 0, passwordBytes.Length);
 
-                password = new SecureString();
-                foreach (char c in passwordChars)
-                {
-                    password.AppendChar(c);
-                }
-                password.MakeReadOnly(); // Wichtig! SecureString abschließen
-
-                // 4. Lösche die temporäre managed Kopie der Passwort-Bytes
-                HighlySecureAuthenticatedVersionedCipher.ClearBytes(passwordBytes);
+                return new NetworkCredential(username, password);
             }
-            else
-            {
-                // Credential gefunden, aber kein PasswortBlob vorhanden (sollte nicht vorkommen für Passwörter)
-                Console.WriteLine("Warning: Credential found, but no password data in blob.");
-            }
-
-            return password; // Gib SecureString zurück
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Exception loading credential: {ex.Message}");
-            return null;
-        }
-        finally
-        {
-            // 5. Speicher, den die API zugewiesen hat (credPtr), MUSS freigegeben werden!
-            if (credPtr != IntPtr.Zero)
+            finally
             {
                 CredFree(credPtr);
             }
         }
-    }
 
-    /// <summary>
-    /// Löscht ein Passwort aus dem Windows Credential Manager.
-    /// </summary>
-    /// <param name="targetName">Der eindeutige Name des Credentials.</param>
-    /// <returns>True, wenn erfolgreich oder nicht gefunden, False bei anderem Fehler.</returns>
-    public static bool DeletePassword(string targetName)
-    {
-        if (string.IsNullOrEmpty(targetName)) throw new ArgumentNullException(nameof(targetName));
-
-        // Credential löschen
-        bool success = CredDelete(targetName, CREDENTIAL_TYPE.GENERIC, 0);
-
-        if (!success)
+        /// <summary>
+        /// Retrieves a credential from the Windows Credential Manager as SecureString
+        /// </summary>
+        /// <param name="target">The target name of the credential</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <returns>A SecureNetworkCredential object if found, null otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target is null or empty</exception>
+        public static SecureNetworkCredential? GetSecureCredential(string target, CredentialType type = CredentialType.Generic)
         {
-            int error = Marshal.GetLastWin32Error();
-            // ERROR_NOT_FOUND (1168) bedeutet, es gab nichts zu löschen, was in Ordnung ist.
-            if (error != 1168)
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+
+            IntPtr credPtr;
+            if (!CredRead(target, (int)type, 0, out credPtr))
             {
-                Console.WriteLine($"Error deleting credential: {error} (Win32 Error)");
-                return false; // Fehler
+                return null;
+            }
+
+            try
+            {
+                CREDENTIAL cred = Marshal.PtrToStructure<CREDENTIAL>(credPtr);
+                string username = Marshal.PtrToStringUni(cred.UserName) ?? string.Empty;
+                SecureString? securePassword = null;
+
+                if (cred.CredentialBlob != IntPtr.Zero && cred.CredentialBlobSize > 0)
+                {
+                    byte[] passwordBytes = new byte[cred.CredentialBlobSize];
+                    Marshal.Copy(cred.CredentialBlob, passwordBytes, 0, cred.CredentialBlobSize);
+                    try
+                    {
+                        securePassword = BytesToSecureString(passwordBytes);
+                    }
+                    finally
+                    {
+                        SecureClearBytes(passwordBytes);
+                    }
+                }
+
+                return new SecureNetworkCredential(username, securePassword ?? new SecureString());
+            }
+            finally
+            {
+                CredFree(credPtr);
             }
         }
 
-        return true; // Erfolgreich gelöscht oder war nicht vorhanden
+        /// <summary>
+        /// Deletes a credential from the Windows Credential Manager
+        /// </summary>
+        /// <param name="target">The target name of the credential</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <returns>True if successful, false otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target is null or empty</exception>
+        public static bool DeleteCredential(string target, CredentialType type = CredentialType.Generic)
+        {
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+
+            return CredDelete(target, (int)type, 0);
+        }
+
+        /// <summary>
+        /// Enumerates all credentials in the Windows Credential Manager
+        /// </summary>
+        /// <param name="filter">Optional filter for credential names</param>
+        /// <returns>A list of credential information</returns>
+        /// <exception cref="Win32Exception">Thrown when enumeration fails</exception>
+        public static List<CredentialInfo> EnumerateCredentials(string? filter = null)
+        {
+            List<CredentialInfo> credentials = new List<CredentialInfo>();
+            IntPtr pCredentials;
+            int count;
+
+            if (!CredEnumerate(filter, 0, out count, out pCredentials))
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == 1168) // ERROR_NOT_FOUND
+                    return credentials;
+                
+                throw new Win32Exception(error);
+            }
+
+            try
+            {
+                IntPtr[] credentialPtrs = new IntPtr[count];
+                Marshal.Copy(pCredentials, credentialPtrs, 0, count);
+
+                for (int i = 0; i < count; i++)
+                {
+                    CREDENTIAL cred = Marshal.PtrToStructure<CREDENTIAL>(credentialPtrs[i]);
+                    
+                    string target = Marshal.PtrToStringUni(cred.TargetName) ?? string.Empty;
+                    string username = Marshal.PtrToStringUni(cred.UserName) ?? string.Empty;
+                    string comment = Marshal.PtrToStringUni(cred.Comment) ?? string.Empty;
+
+                    credentials.Add(new CredentialInfo
+                    {
+                        Target = target,
+                        Username = username,
+                        Comment = comment,
+                        Type = (CredentialType)cred.Type,
+                        Persistence = (CredentialPersistence)cred.Persist
+                    });
+                }
+            }
+            finally
+            {
+                CredFree(pCredentials);
+            }
+
+            return credentials;
+        }
+
+        /// <summary>
+        /// Checks if a credential exists in the Windows Credential Manager
+        /// </summary>
+        /// <param name="target">The target name of the credential</param>
+        /// <param name="type">The credential type (default: Generic)</param>
+        /// <returns>True if the credential exists, false otherwise</returns>
+        /// <exception cref="ArgumentException">Thrown when target is null or empty</exception>
+        public static bool CredentialExists(string target, CredentialType type = CredentialType.Generic)
+        {
+            if (string.IsNullOrEmpty(target))
+                throw new ArgumentException("Target cannot be null or empty", nameof(target));
+
+            IntPtr credPtr;
+            if (CredRead(target, (int)type, 0, out credPtr))
+            {
+                CredFree(credPtr);
+                return true;
+            }
+            return false;
+        }
+
+        #endregion
     }
+
+    #region Supporting Classes and Enums
+
+    /// <summary>
+    /// Represents credential information
+    /// </summary>
+    public class CredentialInfo
+    {
+        /// <summary>
+        /// The target name of the credential
+        /// </summary>
+        public string Target { get; set; } = string.Empty;
+
+        /// <summary>
+        /// The username associated with the credential
+        /// </summary>
+        public string Username { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Optional comment for the credential
+        /// </summary>
+        public string Comment { get; set; } = string.Empty;
+
+        /// <summary>
+        /// The type of the credential
+        /// </summary>
+        public CredentialType Type { get; set; }
+
+        /// <summary>
+        /// The persistence level of the credential
+        /// </summary>
+        public CredentialPersistence Persistence { get; set; }
+    }
+
+    /// <summary>
+    /// Represents a network credential with username and password
+    /// </summary>
+    public class NetworkCredential
+    {
+        /// <summary>
+        /// The username
+        /// </summary>
+        public string Username { get; set; }
+
+        /// <summary>
+        /// The password
+        /// </summary>
+        public string Password { get; set; }
+
+        /// <summary>
+        /// Initializes a new instance of NetworkCredential
+        /// </summary>
+        /// <param name="username">The username</param>
+        /// <param name="password">The password</param>
+        public NetworkCredential(string username, string password)
+        {
+            Username = username ?? string.Empty;
+            Password = password ?? string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Represents a network credential with username and secure password
+    /// </summary>
+    public class SecureNetworkCredential : IDisposable
+    {
+        /// <summary>
+        /// The username
+        /// </summary>
+        public string Username { get; set; }
+
+        /// <summary>
+        /// The password as SecureString
+        /// </summary>
+        public SecureString Password { get; set; }
+
+        /// <summary>
+        /// Initializes a new instance of SecureNetworkCredential
+        /// </summary>
+        /// <param name="username">The username</param>
+        /// <param name="password">The password as SecureString</param>
+        public SecureNetworkCredential(string username, SecureString password)
+        {
+            Username = username ?? string.Empty;
+            Password = password ?? new SecureString();
+        }
+
+        /// <summary>
+        /// Disposes the SecureString password
+        /// </summary>
+        public void Dispose()
+        {
+            Password?.Dispose();
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    /// <summary>
+    /// Credential types supported by Windows Credential Manager
+    /// </summary>
+    public enum CredentialType
+    {
+        /// <summary>
+        /// Generic credential type
+        /// </summary>
+        Generic = 1,
+
+        /// <summary>
+        /// Domain password credential
+        /// </summary>
+        DomainPassword = 2,
+
+        /// <summary>
+        /// Domain certificate credential
+        /// </summary>
+        DomainCertificate = 3,
+
+        /// <summary>
+        /// Domain visible password credential
+        /// </summary>
+        DomainVisiblePassword = 4,
+
+        /// <summary>
+        /// Generic certificate credential
+        /// </summary>
+        GenericCertificate = 5,
+
+        /// <summary>
+        /// Domain extended credential
+        /// </summary>
+        DomainExtended = 6,
+
+        /// <summary>
+        /// Maximum credential type value
+        /// </summary>
+        Maximum = 7,
+
+        /// <summary>
+        /// Extended maximum credential type value
+        /// </summary>
+        MaximumEx = 1007
+    }
+
+    /// <summary>
+    /// Credential persistence options
+    /// </summary>
+    public enum CredentialPersistence
+    {
+        /// <summary>
+        /// Credential persists for the current session only
+        /// </summary>
+        Session = 1,
+
+        /// <summary>
+        /// Credential persists on the local machine
+        /// </summary>
+        LocalMachine = 2,
+
+        /// <summary>
+        /// Credential persists across the enterprise
+        /// </summary>
+        Enterprise = 3
+    }
+
+    #endregion
 }
