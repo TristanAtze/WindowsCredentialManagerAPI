@@ -1,0 +1,92 @@
+name: nuget-autopublish-on-commit
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set git identity (for tagging)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Find version in commit messages
+        id: ver
+        shell: bash
+        run: |
+          msgs=$(jq -r '.commits[].message' < "$GITHUB_EVENT_PATH")
+          ver=""
+          while IFS= read -r line; do
+            if [[ "$line" =~ nuget:[[:space:]]*v?([0-9]+(\.[0-9]+){1,2}(-[0-9A-Za-z\.-]+)?(\+[0-9A-Za-z\.-]+)?) ]]; then
+              ver="${BASH_REMATCH[1]}"
+              break
+            fi
+          done <<< "$msgs"
+
+          if [[ -z "$ver" ]]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No version marker found (use 'nuget: 1.2.3')."
+          else
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "version=$ver" >> $GITHUB_OUTPUT
+            echo "Detected version: $ver"
+          fi
+
+      - name: Stop when no version was found
+        if: ${{ steps.ver.outputs.found != 'true' }}
+        run: |
+            echo "Skipping publish (no 'nuget: <version>' in commit messages)."
+
+      - name: Restore
+        if: ${{ steps.ver.outputs.found == 'true' }}
+        run: dotnet restore
+
+      - name: Build
+        if: ${{ steps.ver.outputs.found == 'true' }}
+        run: dotnet build -c Release --no-restore
+
+      # Passe den Pfad ggf. auf dein .csproj an:
+      - name: Pack
+        if: ${{ steps.ver.outputs.found == 'true' }}
+        run: |
+          dotnet pack -c Release --no-build \
+            -p:PackageVersion=${{ steps.ver.outputs.version }} \
+            -o ./artifacts .
+
+      - name: Create & push git tag v<version>
+        if: ${{ steps.ver.outputs.found == 'true' }}
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Push package to nuget.org
+        if: ${{ steps.ver.outputs.found == 'true' }}
+        run: |
+          dotnet nuget push "artifacts/*.nupkg" \
+            --api-key "${{ secrets.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
