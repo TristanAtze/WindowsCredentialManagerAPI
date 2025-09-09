@@ -343,7 +343,6 @@ namespace WindowsCredentialManagerAPI
                 
                 throw new Win32Exception(error);
             }
-
             try
             {
                 IntPtr[] credentialPtrs = new IntPtr[count];
